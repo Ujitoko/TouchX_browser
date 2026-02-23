@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TouchX Haptic Demo</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #1a1a2e; }
+  #status {
+    position: fixed; top: 10px; left: 10px; z-index: 100;
+    font: 14px/1.4 'Consolas', monospace; color: #aaa;
+    background: rgba(0,0,0,0.6); padding: 8px 14px; border-radius: 6px;
+    pointer-events: none;
+  }
+  #status .dot { display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  #status .on  { background: #4f4; }
+  #status .off { background: #f44; }
+</style>
+</head>
+<body>
+
+<div id="status">
+  <span class="dot off" id="dot"></span>
+  <span id="msg">Connecting&hellip;</span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ---- Scene --------------------------------------------------- */
+const scene    = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 300, 600);
+
+const camera   = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 1, 1000);
+camera.position.set(0, 70, 200);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+
+/* ---- Lights -------------------------------------------------- */
+scene.add(new THREE.AmbientLight(0x404060, 2.0));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(60, 120, 80);
+scene.add(dirLight);
+const backLight = new THREE.DirectionalLight(0x4466aa, 0.5);
+backLight.position.set(-40, -20, -60);
+scene.add(backLight);
+
+/* ---- Grid floor ---------------------------------------------- */
+const grid = new THREE.GridHelper(300, 30, 0x444488, 0x2a2a50);
+grid.position.y = -60;
+scene.add(grid);
+
+/* ---- Sphere -------------------------------------------------- */
+const SPHERE_R = 40;
+
+const sphereMat = new THREE.MeshPhysicalMaterial({
+  color: 0x4488ff, transparent: true, opacity: 0.25,
+  roughness: 0.1, metalness: 0.0, side: THREE.DoubleSide,
+  depthWrite: false
+});
+const sphere = new THREE.Mesh(
+  new THREE.SphereGeometry(SPHERE_R, 64, 64), sphereMat
+);
+scene.add(sphere);
+
+const wireMat = new THREE.MeshBasicMaterial({
+  color: 0x4488ff, wireframe: true, transparent: true, opacity: 0.12
+});
+const wireframe = new THREE.Mesh(
+  new THREE.SphereGeometry(SPHERE_R + 0.3, 32, 32), wireMat
+);
+scene.add(wireframe);
+
+/* ---- Cursor (stylus tip) ------------------------------------- */
+const cursorGroup = new THREE.Group();
+
+const coneMat = new THREE.MeshPhongMaterial({ color: 0xff8800, emissive: 0x442200 });
+const cone = new THREE.Mesh(new THREE.ConeGeometry(3, 15, 8), coneMat);
+cone.rotation.x = Math.PI;  /* point downward */
+cursorGroup.add(cone);
+
+const tipMat = new THREE.MeshPhongMaterial({ color: 0xffcc00, emissive: 0x664400 });
+const tip = new THREE.Mesh(new THREE.SphereGeometry(1.5, 16, 16), tipMat);
+tip.position.y = -7.5;
+cursorGroup.add(tip);
+
+scene.add(cursorGroup);
+
+/* ---- Force arrow --------------------------------------------- */
+const arrowDir = new THREE.Vector3(1, 0, 0);
+const forceArrow = new THREE.ArrowHelper(arrowDir, new THREE.Vector3(), 1, 0xff2222);
+forceArrow.visible = false;
+scene.add(forceArrow);
+
+/* ---- State --------------------------------------------------- */
+let isTouching = false;
+const statusDot = document.getElementById('dot');
+const statusMsg = document.getElementById('msg');
+
+/* ---- WebSocket ----------------------------------------------- */
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}`);
+
+  ws.onopen = () => {
+    console.log('WebSocket connected');
+    statusDot.className = 'dot on';
+    statusMsg.textContent = 'Connected';
+  };
+
+  ws.onclose = (e) => {
+    console.log('WebSocket closed: code=' + e.code + ' reason=' + e.reason + ' clean=' + e.wasClean);
+    statusDot.className = 'dot off';
+    statusMsg.textContent = 'Disconnected \u2013 reconnecting\u2026';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = (e) => { console.error('WebSocket error', e); ws.close(); };
+
+  ws.onmessage = (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (err) {
+      console.error('JSON parse error:', err, e.data);
+      return;
+    }
+
+    /* Cursor position */
+    cursorGroup.position.set(d.pos[0], d.pos[1], d.pos[2]);
+
+    /* Touch state */
+    isTouching = d.touch;
+    if (d.touch) {
+      sphereMat.color.setHex(0xff4466);
+      sphereMat.opacity = 0.45;
+      sphereMat.emissive.setHex(0x331111);
+      wireMat.color.setHex(0xff4466);
+    } else {
+      sphereMat.color.setHex(0x4488ff);
+      sphereMat.opacity = 0.25;
+      sphereMat.emissive.setHex(0x000000);
+      wireMat.color.setHex(0x4488ff);
+    }
+
+    /* Force arrow */
+    const fm = Math.sqrt(d.force[0]**2 + d.force[1]**2 + d.force[2]**2);
+    if (fm > 0.01) {
+      const dir = new THREE.Vector3(d.force[0], d.force[1], d.force[2]).normalize();
+      const len = fm * 30;
+      forceArrow.position.copy(cursorGroup.position);
+      forceArrow.setDirection(dir);
+      forceArrow.setLength(len, Math.min(len * 0.2, 8), Math.min(len * 0.1, 4));
+      forceArrow.visible = true;
+    } else {
+      forceArrow.visible = false;
+    }
+
+    /* Status text */
+    const posStr = `(${d.pos[0].toFixed(1)}, ${d.pos[1].toFixed(1)}, ${d.pos[2].toFixed(1)})`;
+    const forceStr = fm > 0.01 ? ` | Force: ${fm.toFixed(2)} N` : '';
+    statusMsg.textContent =
+      `${d.model} | ${d.touch ? 'TOUCHING' : 'Free'} | Pos: ${posStr}${forceStr}`;
+  };
+}
+connect();
+
+/* ---- Resize -------------------------------------------------- */
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ---- Animate ------------------------------------------------- */
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+
+  /* Subtle sphere pulse on touch */
+  if (isTouching) {
+    const s = 1.0 + Math.sin(performance.now() * 0.008) * 0.02;
+    sphere.scale.setScalar(s);
+    wireframe.scale.setScalar(s);
+  } else {
+    sphere.scale.setScalar(1.0);
+    wireframe.scale.setScalar(1.0);
+  }
+
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>

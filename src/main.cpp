@@ -34,6 +34,8 @@
 static struct {
     double pos[3];
     double force[3];
+    double contactPt[3];
+    double penetration;
     int    buttons;
     bool   touching;
 } g_haptic = {};
@@ -42,8 +44,9 @@ static std::mutex  g_mutex;
 static const char* g_model = "Unknown";
 
 /* Scene: sphere at origin */
-static constexpr double SPHERE_R  = 40.0;  /* mm */
-static constexpr double STIFFNESS = 0.5;   /* N/mm */
+static constexpr double SPHERE_R  = 40.0;   /* mm */
+static constexpr double MAX_FORCE = 3.3;    /* N – device safety cap */
+static double g_hertzK = 0.08;              /* N/mm^1.5 – adjustable via WebSocket */
 
 /* Graceful shutdown */
 static volatile bool g_running = true;
@@ -175,6 +178,23 @@ static bool wsRecvFrame(SOCKET s) {
     std::string payload((size_t)plen, '\0');
     if (plen > 0 && !recvAll(s, &payload[0], (int)plen)) return false;
 
+    /* Unmask */
+    if (masked) {
+        for (size_t i = 0; i < payload.size(); i++)
+            payload[i] ^= mask[i % 4];
+    }
+
+    /* Parse text frames for settings (e.g. {"k":0.05}) */
+    if (opcode == 0x1 && !payload.empty()) {
+        auto kp = payload.find("\"k\":");
+        if (kp != std::string::npos) {
+            double val = 0;
+            if (std::sscanf(payload.c_str() + kp + 4, "%lf", &val) == 1) {
+                if (val >= 0.005 && val <= 1.0) g_hertzK = val;
+            }
+        }
+    }
+
     if (opcode == 0x8) {                       /* close */
         uint8_t cf[] = {0x88, 0x00};
         send(s, (char*)cf, 2, 0);
@@ -224,17 +244,30 @@ static HDCallbackCode HDCALLBACK servoLoop(void*) {
     HDint btn = 0;
     hdGetIntegerv(HD_CURRENT_BUTTONS, &btn);
 
-    /* Sphere collision (sphere centred at origin) */
+    /* Sphere collision (sphere centred at origin) – Hertzian contact */
     double dist = std::sqrt(pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2]);
     double f[3] = {0, 0, 0};
+    double cpt[3] = {0, 0, 0};
+    double pen = 0.0;
     bool   touch = false;
 
     if (dist < SPHERE_R && dist > 1e-4) {
-        double pen = SPHERE_R - dist;
+        pen = SPHERE_R - dist;
         double inv = 1.0 / dist;
-        f[0] = STIFFNESS * pen * pos[0] * inv;
-        f[1] = STIFFNESS * pen * pos[1] * inv;
-        f[2] = STIFFNESS * pen * pos[2] * inv;
+
+        /* Hertzian: F = K * pen^1.5  (soft entry, progressive stiffening) */
+        double fmag = g_hertzK * pen * std::sqrt(pen);
+        if (fmag > MAX_FORCE) fmag = MAX_FORCE;
+
+        f[0] = fmag * pos[0] * inv;
+        f[1] = fmag * pos[1] * inv;
+        f[2] = fmag * pos[2] * inv;
+
+        /* Contact point on sphere surface */
+        cpt[0] = pos[0] * inv * SPHERE_R;
+        cpt[1] = pos[1] * inv * SPHERE_R;
+        cpt[2] = pos[2] * inv * SPHERE_R;
+
         touch = true;
     }
 
@@ -243,10 +276,12 @@ static HDCallbackCode HDCALLBACK servoLoop(void*) {
 
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        std::memcpy(g_haptic.pos,   pos, sizeof pos);
-        std::memcpy(g_haptic.force, f,   sizeof f);
-        g_haptic.buttons  = btn;
-        g_haptic.touching = touch;
+        std::memcpy(g_haptic.pos,      pos, sizeof pos);
+        std::memcpy(g_haptic.force,    f,   sizeof f);
+        std::memcpy(g_haptic.contactPt, cpt, sizeof cpt);
+        g_haptic.penetration = pen;
+        g_haptic.buttons     = btn;
+        g_haptic.touching    = touch;
     }
     return HD_CALLBACK_CONTINUE;
 }
@@ -429,23 +464,28 @@ int main() {
         if (wsClient != INVALID_SOCKET && now - lastSend >= 16) {
             lastSend = now;
 
-            double p[3], f[3];
+            double p[3], f[3], cpt[3];
+            double pen;
             int    btn;
             bool   touch;
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
-                std::memcpy(p, g_haptic.pos,   sizeof p);
-                std::memcpy(f, g_haptic.force,  sizeof f);
+                std::memcpy(p,   g_haptic.pos,      sizeof p);
+                std::memcpy(f,   g_haptic.force,    sizeof f);
+                std::memcpy(cpt, g_haptic.contactPt, sizeof cpt);
+                pen   = g_haptic.penetration;
                 btn   = g_haptic.buttons;
                 touch = g_haptic.touching;
             }
 
-            char json[256];
+            char json[512];
             snprintf(json, sizeof json,
                 "{\"pos\":[%.2f,%.2f,%.2f],\"btn\":%d,\"touch\":%s,"
-                "\"force\":[%.3f,%.3f,%.3f],\"model\":\"%s\"}",
+                "\"force\":[%.3f,%.3f,%.3f],\"model\":\"%s\","
+                "\"pen\":%.2f,\"cpt\":[%.2f,%.2f,%.2f]}",
                 p[0], p[1], p[2], btn, touch ? "true" : "false",
-                f[0], f[1], f[2], g_model);
+                f[0], f[1], f[2], g_model,
+                pen, cpt[0], cpt[1], cpt[2]);
 
             if (!wsSend(wsClient, json)) {
                 printf("WebSocket send failed, disconnecting.\n");

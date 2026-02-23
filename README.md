@@ -59,17 +59,21 @@ The server sends text WebSocket frames at ~60 Hz:
   "btn": 0,
   "touch": false,
   "force": [fx, fy, fz],
-  "model": "Touch X"
+  "model": "Touch X",
+  "pen": 5.2,
+  "cpt": [28.3, 28.3, 0.0]
 }
 ```
 
-| Field   | Description                                    |
-|---------|------------------------------------------------|
-| `pos`   | Stylus tip position in mm (device coordinates) |
-| `btn`   | Button bitmask                                 |
-| `touch` | `true` if stylus is inside the sphere          |
-| `force` | Force feedback vector in N                     |
-| `model` | Device model string                            |
+| Field   | Description                                           |
+|---------|-------------------------------------------------------|
+| `pos`   | Stylus tip position in mm (device coordinates)        |
+| `btn`   | Button bitmask                                        |
+| `touch` | `true` if stylus is inside the sphere                 |
+| `force` | Force feedback vector in N (Hertzian contact model)   |
+| `model` | Device model string                                   |
+| `pen`   | Penetration depth in mm (0 when not touching)         |
+| `cpt`   | Contact point on sphere surface `[x, y, z]` in mm    |
 
 ## Project Structure
 

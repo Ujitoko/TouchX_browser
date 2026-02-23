@@ -15,6 +15,13 @@
     border-radius: 50%; margin-right: 6px; vertical-align: middle; }
   #status .on  { background: #4f4; }
   #status .off { background: #f44; }
+  #controls {
+    position: fixed; bottom: 14px; left: 10px; z-index: 100;
+    font: 13px/1.4 'Consolas', monospace; color: #aaa;
+    background: rgba(0,0,0,0.6); padding: 8px 14px; border-radius: 6px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  #controls input[type=range] { width: 160px; accent-color: #4488ff; }
 </style>
 </head>
 <body>
@@ -22,6 +29,10 @@
 <div id="status">
   <span class="dot off" id="dot"></span>
   <span id="msg">Connecting&hellip;</span>
+</div>
+<div id="controls">
+  <span>Softness</span>
+  <input type="range" id="softness" min="0" max="100" value="40">
 </div>
 
 <script type="importmap">
@@ -71,35 +82,47 @@ scene.add(grid);
 /* ---- Sphere -------------------------------------------------- */
 const SPHERE_R = 40;
 
+const sphereGeo = new THREE.SphereGeometry(SPHERE_R, 64, 64);
 const sphereMat = new THREE.MeshPhysicalMaterial({
-  color: 0x4488ff, transparent: true, opacity: 0.25,
+  color: 0xffffff, transparent: true, opacity: 0.25,
   roughness: 0.1, metalness: 0.0, side: THREE.DoubleSide,
-  depthWrite: false
+  depthWrite: false, vertexColors: true
 });
-const sphere = new THREE.Mesh(
-  new THREE.SphereGeometry(SPHERE_R, 64, 64), sphereMat
-);
+const sphere = new THREE.Mesh(sphereGeo, sphereMat);
 scene.add(sphere);
 
+const wireGeo = new THREE.SphereGeometry(SPHERE_R + 0.3, 32, 32);
 const wireMat = new THREE.MeshBasicMaterial({
-  color: 0x4488ff, wireframe: true, transparent: true, opacity: 0.12
+  color: 0xffffff, wireframe: true, transparent: true, opacity: 0.12,
+  vertexColors: true
 });
-const wireframe = new THREE.Mesh(
-  new THREE.SphereGeometry(SPHERE_R + 0.3, 32, 32), wireMat
-);
+const wireframe = new THREE.Mesh(wireGeo, wireMat);
 scene.add(wireframe);
+
+/* Clone rest positions & add vertex color attributes */
+function initDeformable(geo, baseColor) {
+  const pos = geo.attributes.position;
+  const rest = new Float32Array(pos.array.length);
+  rest.set(pos.array);
+  geo.userData.restPos = rest;
+
+  const colors = new Float32Array(pos.count * 3);
+  const c = new THREE.Color(baseColor);
+  for (let i = 0; i < pos.count; i++) {
+    colors[i * 3]     = c.r;
+    colors[i * 3 + 1] = c.g;
+    colors[i * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+}
+initDeformable(sphereGeo, 0x4488ff);
+initDeformable(wireGeo, 0x4488ff);
 
 /* ---- Cursor (stylus tip) ------------------------------------- */
 const cursorGroup = new THREE.Group();
 
-const coneMat = new THREE.MeshPhongMaterial({ color: 0xff8800, emissive: 0x442200 });
-const cone = new THREE.Mesh(new THREE.ConeGeometry(3, 15, 8), coneMat);
-cone.rotation.x = Math.PI;  /* point downward */
-cursorGroup.add(cone);
-
 const tipMat = new THREE.MeshPhongMaterial({ color: 0xffcc00, emissive: 0x664400 });
-const tip = new THREE.Mesh(new THREE.SphereGeometry(1.5, 16, 16), tipMat);
-tip.position.y = -7.5;
+const tip = new THREE.Mesh(new THREE.SphereGeometry(2, 16, 16), tipMat);
 cursorGroup.add(tip);
 
 scene.add(cursorGroup);
@@ -112,17 +135,124 @@ scene.add(forceArrow);
 
 /* ---- State --------------------------------------------------- */
 let isTouching = false;
+let targetPen = 0;
+let currentPen = 0;
+let contactDir = new THREE.Vector3();
+let lastModel = '';
+let lastForceMag = 0;
+let lastPosStr = '';
 const statusDot = document.getElementById('dot');
 const statusMsg = document.getElementById('msg');
 
+/* ---- Softness slider ----------------------------------------- */
+const softnessEl = document.getElementById('softness');
+let currentSoftness = parseInt(softnessEl.value);
+
+function softnessToK(s) {
+  /* Exponential map: s=0 → K=0.50 (hard), s=100 → K=0.005 (very soft) */
+  return 0.50 * Math.pow(0.01, s / 100);
+}
+
+function sendStiffness() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ k: softnessToK(currentSoftness) }));
+  }
+}
+
+softnessEl.addEventListener('input', () => {
+  currentSoftness = parseInt(softnessEl.value);
+  sendStiffness();
+});
+
+/* ---- Deformation engine -------------------------------------- */
+const BULGE_FRAC = 0.08;              /* volume-preservation bulge */
+const baseColor = new THREE.Color(0x4488ff);
+const touchColor = new THREE.Color(0xff4488);
+
+function deformSphere(geo, pen, dir, influenceAngle) {
+  const restPos  = geo.userData.restPos;
+  const posAttr  = geo.attributes.position;
+  const colAttr  = geo.attributes.color;
+  const verts    = posAttr.array;
+  const colors   = colAttr.array;
+  const count    = posAttr.count;
+
+  const dx = dir.x, dy = dir.y, dz = dir.z;
+
+  for (let i = 0; i < count; i++) {
+    const i3 = i * 3;
+    const rx = restPos[i3], ry = restPos[i3 + 1], rz = restPos[i3 + 2];
+
+    /* Vertex direction from origin (already on unit sphere * R) */
+    const rLen = Math.sqrt(rx * rx + ry * ry + rz * rz);
+    if (rLen < 1e-6) { continue; }
+    const invR = 1.0 / rLen;
+    const vx = rx * invR, vy = ry * invR, vz = rz * invR;
+
+    /* Angle between vertex normal and contact direction */
+    const cosA = vx * dx + vy * dy + vz * dz;
+    const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
+
+    let displacement = 0;
+
+    if (angle < influenceAngle && pen > 0) {
+      /* Cosine falloff: max at contact point, zero at edge of cone */
+      const t = 1.0 - angle / influenceAngle;
+      const falloff = 0.5 * (1.0 + Math.cos(Math.PI * (1.0 - t)));
+      displacement = -pen * falloff;
+    } else if (angle < influenceAngle * 1.6 && angle >= influenceAngle && pen > 0) {
+      /* Small outward bulge just outside the cone (volume preservation) */
+      const t = (angle - influenceAngle) / (influenceAngle * 0.6);
+      const bulge = BULGE_FRAC * pen * Math.cos(t * Math.PI * 0.5);
+      displacement = bulge;
+    }
+
+    /* Apply displacement along vertex normal */
+    verts[i3]     = rx + vx * displacement;
+    verts[i3 + 1] = ry + vy * displacement;
+    verts[i3 + 2] = rz + vz * displacement;
+
+    /* Color: blue (rest) -> pink (compressed) */
+    const strain = Math.min(1.0, Math.abs(displacement) / Math.max(pen, 0.1));
+    const c = baseColor.clone().lerp(touchColor, strain);
+    colors[i3]     = c.r;
+    colors[i3 + 1] = c.g;
+    colors[i3 + 2] = c.b;
+  }
+
+  posAttr.needsUpdate = true;
+  colAttr.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+
+function resetSphere(geo) {
+  const restPos = geo.userData.restPos;
+  const posAttr = geo.attributes.position;
+  const colAttr = geo.attributes.color;
+  posAttr.array.set(restPos);
+
+  const colors = colAttr.array;
+  for (let i = 0; i < colAttr.count; i++) {
+    colors[i * 3]     = baseColor.r;
+    colors[i * 3 + 1] = baseColor.g;
+    colors[i * 3 + 2] = baseColor.b;
+  }
+
+  posAttr.needsUpdate = true;
+  colAttr.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+
 /* ---- WebSocket ----------------------------------------------- */
+let ws = null;
 function connect() {
-  const ws = new WebSocket(`ws://${location.host}`);
+  ws = new WebSocket(`ws://${location.host}`);
 
   ws.onopen = () => {
     console.log('WebSocket connected');
     statusDot.className = 'dot on';
     statusMsg.textContent = 'Connected';
+    sendStiffness();
   };
 
   ws.onclose = (e) => {
@@ -144,22 +274,27 @@ function connect() {
     /* Cursor position */
     cursorGroup.position.set(d.pos[0], d.pos[1], d.pos[2]);
 
-    /* Touch state */
+    /* Touch / deformation state */
     isTouching = d.touch;
-    if (d.touch) {
-      sphereMat.color.setHex(0xff4466);
-      sphereMat.opacity = 0.45;
+    if (d.touch && d.pen > 0) {
+      targetPen = d.pen;
+      /* Contact direction: from origin toward contact point (normalized) */
+      const cx = d.cpt[0], cy = d.cpt[1], cz = d.cpt[2];
+      const cLen = Math.sqrt(cx * cx + cy * cy + cz * cz);
+      if (cLen > 1e-4) {
+        contactDir.set(cx / cLen, cy / cLen, cz / cLen);
+      }
+      sphereMat.opacity = 0.25 + 0.20 * Math.min(1, d.pen / 15);
       sphereMat.emissive.setHex(0x331111);
-      wireMat.color.setHex(0xff4466);
     } else {
-      sphereMat.color.setHex(0x4488ff);
+      targetPen = 0;
       sphereMat.opacity = 0.25;
       sphereMat.emissive.setHex(0x000000);
-      wireMat.color.setHex(0x4488ff);
     }
 
     /* Force arrow */
     const fm = Math.sqrt(d.force[0]**2 + d.force[1]**2 + d.force[2]**2);
+    lastForceMag = fm;
     if (fm > 0.01) {
       const dir = new THREE.Vector3(d.force[0], d.force[1], d.force[2]).normalize();
       const len = fm * 30;
@@ -171,11 +306,9 @@ function connect() {
       forceArrow.visible = false;
     }
 
-    /* Status text */
-    const posStr = `(${d.pos[0].toFixed(1)}, ${d.pos[1].toFixed(1)}, ${d.pos[2].toFixed(1)})`;
-    const forceStr = fm > 0.01 ? ` | Force: ${fm.toFixed(2)} N` : '';
-    statusMsg.textContent =
-      `${d.model} | ${d.touch ? 'TOUCHING' : 'Free'} | Pos: ${posStr}${forceStr}`;
+    /* Cache for status text */
+    lastModel = d.model;
+    lastPosStr = `(${d.pos[0].toFixed(1)}, ${d.pos[1].toFixed(1)}, ${d.pos[2].toFixed(1)})`;
   };
 }
 connect();
@@ -188,18 +321,40 @@ addEventListener('resize', () => {
 });
 
 /* ---- Animate ------------------------------------------------- */
+let lastTime = performance.now();
 (function animate() {
   requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
   controls.update();
 
-  /* Subtle sphere pulse on touch */
+  /* Spring-back interpolation for penetration */
   if (isTouching) {
-    const s = 1.0 + Math.sin(performance.now() * 0.008) * 0.02;
-    sphere.scale.setScalar(s);
-    wireframe.scale.setScalar(s);
+    currentPen += (targetPen - currentPen) * Math.min(1, dt * 30);
   } else {
-    sphere.scale.setScalar(1.0);
-    wireframe.scale.setScalar(1.0);
+    /* Exponential decay when not touching */
+    currentPen *= Math.exp(-dt * 12);
+    if (currentPen < 0.01) currentPen = 0;
+  }
+
+  /* Apply deformation – wider influence cone for softer materials */
+  const influenceAngle = Math.PI / 4 + (Math.PI / 4) * (currentSoftness / 100);
+  if (currentPen > 0.01) {
+    deformSphere(sphereGeo, currentPen, contactDir, influenceAngle);
+    deformSphere(wireGeo, currentPen, contactDir, influenceAngle);
+  } else {
+    resetSphere(sphereGeo);
+    resetSphere(wireGeo);
+  }
+
+  /* Status text */
+  const forceStr = lastForceMag > 0.01 ? ` | Force: ${lastForceMag.toFixed(2)} N` : '';
+  const penStr = currentPen > 0.1 ? ` | Indent: ${currentPen.toFixed(1)} mm` : '';
+  if (lastModel) {
+    statusMsg.textContent =
+      `${lastModel} | ${isTouching ? 'TOUCHING' : 'Free'} | Pos: ${lastPosStr}${forceStr}${penStr}`;
   }
 
   renderer.render(scene, camera);

@@ -2,26 +2,26 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>TouchX Haptic Demo</title>
+<title>TouchX Torus</title>
 <style>
-  body { margin: 0; overflow: hidden; background: #000000; }
+  body { margin: 0; overflow: hidden; background: #d4ba96; }
   #status {
     position: fixed; top: 10px; left: 10px; z-index: 100;
-    font: 14px/1.4 'Consolas', monospace; color: #aaa;
-    background: rgba(0,0,0,0.6); padding: 8px 14px; border-radius: 6px;
+    font: 14px/1.4 'Consolas', monospace; color: #8a7a5a;
+    background: rgba(255,255,255,0.35); padding: 8px 14px; border-radius: 6px;
     pointer-events: none;
   }
   #status .dot { display: inline-block; width: 8px; height: 8px;
     border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  #status .on  { background: #4f4; }
+  #status .on  { background: #6b4; }
   #status .off { background: #f44; }
   #controls {
     position: fixed; bottom: 14px; left: 10px; z-index: 100;
-    font: 13px/1.4 'Consolas', monospace; color: #aaa;
-    background: rgba(0,0,0,0.6); padding: 8px 14px; border-radius: 6px;
+    font: 13px/1.4 'Consolas', monospace; color: #8a7a5a;
+    background: rgba(255,255,255,0.35); padding: 8px 14px; border-radius: 6px;
     display: flex; align-items: center; gap: 10px;
   }
-  #controls input[type=range] { width: 160px; accent-color: #88c4a0; }
+  #controls input[type=range] { width: 120px; accent-color: #6b4; }
 </style>
 </head>
 <body>
@@ -31,10 +31,12 @@
   <span id="msg">Connecting&hellip;</span>
 </div>
 <div id="controls">
-  <span>Global</span>
-  <input type="range" id="globalSoft" min="0" max="100" value="40">
-  <span style="margin-left:10px">Local</span>
-  <input type="range" id="localSoft" min="0" max="100" value="50">
+  <span>Softness</span>
+  <input type="range" id="stiffSlider" min="0" max="100" value="55">
+  <span style="margin-left:8px">Spread</span>
+  <input type="range" id="spreadSlider" min="10" max="100" value="50">
+  <span style="margin-left:8px">Pointer</span>
+  <input type="range" id="pointerSize" min="10" max="300" value="60">
 </div>
 
 <script type="importmap">
@@ -51,284 +53,255 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
+/* ---- Constants (match server) -------------------------------- */
+const DISC_RXZ = 35;   /* horizontal radius */
+const DISC_RY  = 25;   /* vertical half-height */
+
 /* ---- Scene --------------------------------------------------- */
-const scene    = new THREE.Scene();
-scene.background = new THREE.Color(0x000000);
-scene.fog = new THREE.Fog(0x000000, 300, 600);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xd4ba96);
 
-const camera   = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 1, 1000);
-camera.position.set(0, 70, 200);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 1, 1000);
+camera.position.set(0, 80, 120);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  powerPreference: 'high-performance'
+});
 renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(devicePixelRatio);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.2;
+renderer.toneMappingExposure = 1.0;
 document.body.appendChild(renderer.domElement);
 
-/* ---- Environment map (needed for transmission/reflections) --- */
-const pmremGenerator = new THREE.PMREMGenerator(renderer);
-scene.environment = pmremGenerator.fromScene(new RoomEnvironment()).texture;
-pmremGenerator.dispose();
+/* Environment map for realistic reflections */
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment()).texture;
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0, 0);
-controls.enableDamping = true;
+const orbitCtrl = new OrbitControls(camera, renderer.domElement);
+orbitCtrl.target.set(0, 5, 0);
+orbitCtrl.enableDamping = true;
 
 /* ---- Lights -------------------------------------------------- */
-scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
-dirLight.position.set(60, 120, 80);
-scene.add(dirLight);
-const backLight = new THREE.DirectionalLight(0xccddee, 1.0);
-backLight.position.set(-40, -20, -60);
-scene.add(backLight);
+scene.add(new THREE.AmbientLight(0xfff5e8, 0.4));
 
-/* ---- Grid floor ---------------------------------------------- */
-const grid = new THREE.GridHelper(300, 30, 0x333333, 0x1a1a1a);
-grid.position.y = -60;
-scene.add(grid);
+const keyLight = new THREE.DirectionalLight(0xfff0dd, 1.2);
+keyLight.position.set(40, 80, 60);
+scene.add(keyLight);
 
-/* ---- Sphere -------------------------------------------------- */
-const SPHERE_R = 40;
+const fillLight = new THREE.DirectionalLight(0xeeddcc, 0.4);
+fillLight.position.set(-30, 20, -40);
+scene.add(fillLight);
 
-const sphereGeo = new THREE.SphereGeometry(SPHERE_R, 64, 64);
-const sphereMat = new THREE.MeshPhysicalMaterial({
-  color: 0xffffff,
-  transmission: 0.95,
-  thickness: 6,
-  roughness: 0.05,
-  metalness: 0,
-  ior: 1.62,
-  attenuationColor: new THREE.Color(0x88c4a0),
-  attenuationDistance: 15,
-  clearcoat: 0.3,
-  clearcoatRoughness: 0.05,
-  vertexColors: true
-});
-const sphere = new THREE.Mesh(sphereGeo, sphereMat);
-scene.add(sphere);
-
-const wireGeo = new THREE.SphereGeometry(SPHERE_R + 0.3, 32, 32);
-const wireMat = new THREE.MeshBasicMaterial({
-  color: 0xffffff, wireframe: true, transparent: true, opacity: 0.04,
-  vertexColors: true
-});
-const wireframe = new THREE.Mesh(wireGeo, wireMat);
-scene.add(wireframe);
-
-/* Clone rest positions & add vertex color attributes */
-function initDeformable(geo, baseColor) {
-  const pos = geo.attributes.position;
-  const rest = new Float32Array(pos.array.length);
-  rest.set(pos.array);
-  geo.userData.restPos = rest;
-
-  const colors = new Float32Array(pos.count * 3);
-  const c = new THREE.Color(baseColor);
+/* ---- Green oblate sphere (deformable) ------------------------ */
+const discGeo = new THREE.SphereGeometry(1, 32, 24);
+/* Scale to oblate ellipsoid: wide in XZ, flat in Y */
+{
+  const pos = discGeo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
-    colors[i * 3]     = c.r;
-    colors[i * 3 + 1] = c.g;
-    colors[i * 3 + 2] = c.b;
+    pos.setX(i, pos.getX(i) * DISC_RXZ);
+    pos.setY(i, pos.getY(i) * DISC_RY);
+    pos.setZ(i, pos.getZ(i) * DISC_RXZ);
   }
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  pos.needsUpdate = true;
+  discGeo.computeVertexNormals();
 }
-initDeformable(sphereGeo, 0xc8e6d0);
-initDeformable(wireGeo, 0xc8e6d0);
 
-/* ---- Cursor (stylus tip) ------------------------------------- */
+const discMat = new THREE.MeshStandardMaterial({
+  color: 0x55cc33,
+  roughness: 0.25,
+  metalness: 0.05,
+  envMapIntensity: 1.5
+});
+const disc = new THREE.Mesh(discGeo, discMat);
+scene.add(disc);
+
+/* Store rest positions and normals */
+const restPos = new Float32Array(discGeo.attributes.position.array.length);
+restPos.set(discGeo.attributes.position.array);
+discGeo.userData.restPos = restPos;
+const restNormals = new Float32Array(discGeo.attributes.normal.array.length);
+restNormals.set(discGeo.attributes.normal.array);
+discGeo.userData.restNormals = restNormals;
+let geoDirty = false;
+
+/* Dispose PMREM generator – no longer needed after env map creation */
+pmrem.dispose();
+
+/* Zero-allocation normal recomputation (avoids Three.js Vector3 objects) */
+const _idxArr = discGeo.index.array;
+function fastNormals(geo) {
+  const pos = geo.attributes.position.array;
+  const nrm = geo.attributes.normal.array;
+  const idx = _idxArr;
+  nrm.fill(0);
+  for (let i = 0, il = idx.length; i < il; i += 3) {
+    const a3 = idx[i] * 3, b3 = idx[i + 1] * 3, c3 = idx[i + 2] * 3;
+    const abx = pos[b3] - pos[a3], aby = pos[b3+1] - pos[a3+1], abz = pos[b3+2] - pos[a3+2];
+    const acx = pos[c3] - pos[a3], acy = pos[c3+1] - pos[a3+1], acz = pos[c3+2] - pos[a3+2];
+    const nx = aby * acz - abz * acy;
+    const ny = abz * acx - abx * acz;
+    const nz = abx * acy - aby * acx;
+    nrm[a3] += nx; nrm[a3+1] += ny; nrm[a3+2] += nz;
+    nrm[b3] += nx; nrm[b3+1] += ny; nrm[b3+2] += nz;
+    nrm[c3] += nx; nrm[c3+1] += ny; nrm[c3+2] += nz;
+  }
+  for (let i = 0, il = nrm.length; i < il; i += 3) {
+    const len = Math.sqrt(nrm[i] * nrm[i] + nrm[i+1] * nrm[i+1] + nrm[i+2] * nrm[i+2]);
+    if (len > 0) { const inv = 1 / len; nrm[i] *= inv; nrm[i+1] *= inv; nrm[i+2] *= inv; }
+  }
+  geo.attributes.normal.needsUpdate = true;
+}
+
+/* ---- Cursor -------------------------------------------------- */
 const cursorGroup = new THREE.Group();
-
-const tipMat = new THREE.MeshPhongMaterial({ color: 0xffcc00, emissive: 0x664400 });
-const tip = new THREE.Mesh(new THREE.SphereGeometry(2, 16, 16), tipMat);
+const tipMat = new THREE.MeshStandardMaterial({
+  color: 0xeeeeee, roughness: 0.2, metalness: 0.1
+});
+const tip = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 16), tipMat);
 cursorGroup.add(tip);
 
+const pointerEl = document.getElementById('pointerSize');
+tip.scale.setScalar(parseFloat(pointerEl.value) / 100 * 2);
+pointerEl.addEventListener('input', () => {
+  tip.scale.setScalar(parseFloat(pointerEl.value) / 100 * 2);
+});
 scene.add(cursorGroup);
-
-/* ---- Force arrow --------------------------------------------- */
-const arrowDir = new THREE.Vector3(1, 0, 0);
-const forceArrow = new THREE.ArrowHelper(arrowDir, new THREE.Vector3(), 1, 0xff2222);
-forceArrow.visible = false;
-scene.add(forceArrow);
 
 /* ---- State --------------------------------------------------- */
 let isTouching = false;
-let targetPen = 0;
+let targetPen  = 0;
 let currentPen = 0;
-let contactDir = new THREE.Vector3();
-let lastModel = '';
-let lastForceMag = 0;
-let lastPosStr = '';
+let contactPt  = new THREE.Vector3();
 const statusDot = document.getElementById('dot');
 const statusMsg = document.getElementById('msg');
 
-/* ---- Softness sliders ---------------------------------------- */
-const globalEl = document.getElementById('globalSoft');
-const localEl  = document.getElementById('localSoft');
-let globalSoftness = parseInt(globalEl.value);
-let localSoftness  = parseInt(localEl.value);
+/* ---- Sliders ------------------------------------------------- */
+const stiffEl  = document.getElementById('stiffSlider');
+const spreadEl = document.getElementById('spreadSlider');
+let stiffVal   = parseInt(stiffEl.value);
+let spreadVal  = parseInt(spreadEl.value);
 
-function softnessToK(s) {
-  /* Exponential map: s=0 → K=0.50 (hard), s=100 → K=0.005 (very soft) */
-  return 0.50 * Math.pow(0.01, s / 100);
+function stiffToK(s) {
+  return 0.1 * Math.pow(50, s / 100);
 }
-
 function sendStiffness() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ k: softnessToK(globalSoftness) }));
+    ws.send(JSON.stringify({ k: stiffToK(stiffVal) }));
   }
 }
-
-globalEl.addEventListener('input', () => {
-  globalSoftness = parseInt(globalEl.value);
+stiffEl.addEventListener('input', () => {
+  stiffVal = parseInt(stiffEl.value);
   sendStiffness();
 });
-
-localEl.addEventListener('input', () => {
-  localSoftness = parseInt(localEl.value);
+spreadEl.addEventListener('input', () => {
+  spreadVal = parseInt(spreadEl.value);
 });
 
-/* ---- Deformation engine -------------------------------------- */
-const BULGE_FRAC = 0.08;              /* volume-preservation bulge */
-const baseColor = new THREE.Color(0xc8e6d0);   /* pale jade green */
-const touchColor = new THREE.Color(0xf0f0e0);  /* warm glow at contact */
-
-function deformSphere(geo, pen, dir, influenceAngle) {
-  const restPos  = geo.userData.restPos;
-  const posAttr  = geo.attributes.position;
-  const colAttr  = geo.attributes.color;
-  const verts    = posAttr.array;
-  const colors   = colAttr.array;
-  const count    = posAttr.count;
-
-  const dx = dir.x, dy = dir.y, dz = dir.z;
+/* ---- Ellipsoid deformation ----------------------------------- */
+function deformDisc(geo, pen, cpt, influenceR) {
+  const rest   = geo.userData.restPos;
+  const posAttr = geo.attributes.position;
+  const verts  = posAttr.array;
+  const count  = posAttr.count;
+  const cx = cpt.x, cy = cpt.y, cz = cpt.z;
 
   for (let i = 0; i < count; i++) {
     const i3 = i * 3;
-    const rx = restPos[i3], ry = restPos[i3 + 1], rz = restPos[i3 + 2];
+    const rx = rest[i3], ry = rest[i3 + 1], rz = rest[i3 + 2];
 
-    /* Vertex direction from origin (already on unit sphere * R) */
-    const rLen = Math.sqrt(rx * rx + ry * ry + rz * rz);
-    if (rLen < 1e-6) { continue; }
-    const invR = 1.0 / rLen;
-    const vx = rx * invR, vy = ry * invR, vz = rz * invR;
+    /* 3D distance from vertex to contact point */
+    const dx = rx - cx, dy = ry - cy, dz = rz - cz;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-    /* Angle between vertex normal and contact direction */
-    const cosA = vx * dx + vy * dy + vz * dz;
-    const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
+    if (dist < influenceR && pen > 0) {
+      const t = 1.0 - dist / influenceR;
+      const falloff = t * t * (3 - 2 * t);
 
-    let displacement = 0;
+      /* Push vertex toward ellipsoid center (squish inward) */
+      const rLen = Math.sqrt(rx * rx + ry * ry + rz * rz);
+      if (rLen < 1e-6) { verts[i3]=rx; verts[i3+1]=ry; verts[i3+2]=rz; continue; }
+      const invR = 1.0 / rLen;
 
-    if (angle < influenceAngle && pen > 0) {
-      /* Cosine falloff: max at contact point, zero at edge of cone */
-      const t = 1.0 - angle / influenceAngle;
-      const falloff = 0.5 * (1.0 + Math.cos(Math.PI * (1.0 - t)));
-      displacement = -pen * falloff;
-    } else if (angle < influenceAngle * 1.6 && angle >= influenceAngle && pen > 0) {
-      /* Small outward bulge just outside the cone (volume preservation) */
-      const t = (angle - influenceAngle) / (influenceAngle * 0.6);
-      const bulge = BULGE_FRAC * pen * Math.cos(t * Math.PI * 0.5);
-      displacement = bulge;
+      const disp = pen * falloff * 0.7;
+      verts[i3]     = rx - rx * invR * disp;
+      verts[i3 + 1] = ry - ry * invR * disp;
+      verts[i3 + 2] = rz - rz * invR * disp;
+    } else {
+      verts[i3]     = rx;
+      verts[i3 + 1] = ry;
+      verts[i3 + 2] = rz;
     }
-
-    /* Apply displacement along vertex normal */
-    verts[i3]     = rx + vx * displacement;
-    verts[i3 + 1] = ry + vy * displacement;
-    verts[i3 + 2] = rz + vz * displacement;
-
-    /* Color: blue (rest) -> pink (compressed) */
-    const strain = Math.min(1.0, Math.abs(displacement) / Math.max(pen, 0.1));
-    const c = baseColor.clone().lerp(touchColor, strain);
-    colors[i3]     = c.r;
-    colors[i3 + 1] = c.g;
-    colors[i3 + 2] = c.b;
   }
 
   posAttr.needsUpdate = true;
-  colAttr.needsUpdate = true;
-  geo.computeVertexNormals();
+  fastNormals(geo);
+  geoDirty = true;
 }
 
-function resetSphere(geo) {
-  const restPos = geo.userData.restPos;
-  const posAttr = geo.attributes.position;
-  const colAttr = geo.attributes.color;
-  posAttr.array.set(restPos);
-
-  const colors = colAttr.array;
-  for (let i = 0; i < colAttr.count; i++) {
-    colors[i * 3]     = baseColor.r;
-    colors[i * 3 + 1] = baseColor.g;
-    colors[i * 3 + 2] = baseColor.b;
-  }
-
-  posAttr.needsUpdate = true;
-  colAttr.needsUpdate = true;
-  geo.computeVertexNormals();
+function resetDisc(geo) {
+  if (!geoDirty) return;
+  geo.attributes.position.array.set(geo.userData.restPos);
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.normal.array.set(geo.userData.restNormals);
+  geo.attributes.normal.needsUpdate = true;
+  geoDirty = false;
 }
 
-/* ---- WebSocket ----------------------------------------------- */
+/* ---- WebSocket (binary protocol) ----------------------------- */
 let ws = null;
-function connect() {
-  ws = new WebSocket(`ws://${location.host}`);
+let pendingBuf = null;  /* ArrayBuffer – only keep latest per frame */
+let wsRecvCount = 0;
 
+function processWsData() {
+  if (!pendingBuf) return;
+  try {
+    const f = new Float64Array(pendingBuf);
+    pendingBuf = null;
+    cursorGroup.position.set(f[0], f[1], f[2]);
+    const pen = f[3];
+    if (pen > 0) {
+      isTouching = true;
+      targetPen  = pen;
+      contactPt.set(f[4], f[5], f[6]);
+    } else {
+      isTouching = false;
+      targetPen  = 0;
+    }
+  } catch (err) {
+    console.error('processWsData error:', err,
+                  'type:', typeof pendingBuf,
+                  'size:', pendingBuf && pendingBuf.byteLength);
+    pendingBuf = null;
+  }
+}
+
+function connect() {
+  wsRecvCount = 0;
+  ws = new WebSocket(`ws://${location.host}`);
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
-    console.log('WebSocket connected');
     statusDot.className = 'dot on';
     statusMsg.textContent = 'Connected';
+    console.log('WS opened');
     sendStiffness();
   };
-
-  ws.onclose = (e) => {
-    console.log('WebSocket closed: code=' + e.code + ' reason=' + e.reason + ' clean=' + e.wasClean);
+  ws.onclose = (ev) => {
+    console.log('WS close: code=' + ev.code + ' clean=' + ev.wasClean
+                + ' msgs=' + wsRecvCount);
     statusDot.className = 'dot off';
-    statusMsg.textContent = 'Disconnected \u2013 reconnecting\u2026';
+    statusMsg.textContent = 'Disconnected (code ' + ev.code
+                            + ', msgs=' + wsRecvCount + ')';
     setTimeout(connect, 2000);
   };
-
-  ws.onerror = (e) => { console.error('WebSocket error', e); ws.close(); };
-
+  ws.onerror = (e) => { console.error('WS error', e); };
   ws.onmessage = (e) => {
-    let d;
-    try { d = JSON.parse(e.data); } catch (err) {
-      console.error('JSON parse error:', err, e.data);
-      return;
+    pendingBuf = e.data;
+    wsRecvCount++;
+    if (wsRecvCount === 1) {
+      console.log('First msg: type=' + (e.data instanceof ArrayBuffer ? 'bin' : 'text')
+                  + ' size=' + (e.data.byteLength || e.data.length));
     }
-
-    /* Cursor position */
-    cursorGroup.position.set(d.pos[0], d.pos[1], d.pos[2]);
-
-    /* Touch / deformation state */
-    isTouching = d.touch;
-    if (d.touch && d.pen > 0) {
-      targetPen = d.pen;
-      /* Contact direction: from origin toward contact point (normalized) */
-      const cx = d.cpt[0], cy = d.cpt[1], cz = d.cpt[2];
-      const cLen = Math.sqrt(cx * cx + cy * cy + cz * cz);
-      if (cLen > 1e-4) {
-        contactDir.set(cx / cLen, cy / cLen, cz / cLen);
-      }
-    } else {
-      targetPen = 0;
-    }
-
-    /* Force arrow */
-    const fm = Math.sqrt(d.force[0]**2 + d.force[1]**2 + d.force[2]**2);
-    lastForceMag = fm;
-    if (fm > 0.01) {
-      const dir = new THREE.Vector3(d.force[0], d.force[1], d.force[2]).normalize();
-      const len = fm * 30;
-      forceArrow.position.copy(cursorGroup.position);
-      forceArrow.setDirection(dir);
-      forceArrow.setLength(len, Math.min(len * 0.2, 8), Math.min(len * 0.1, 4));
-      forceArrow.visible = true;
-    } else {
-      forceArrow.visible = false;
-    }
-
-    /* Cache for status text */
-    lastModel = d.model;
-    lastPosStr = `(${d.pos[0].toFixed(1)}, ${d.pos[1].toFixed(1)}, ${d.pos[2].toFixed(1)})`;
   };
 }
 connect();
@@ -342,39 +315,30 @@ addEventListener('resize', () => {
 
 /* ---- Animate ------------------------------------------------- */
 let lastTime = performance.now();
+
 (function animate() {
   requestAnimationFrame(animate);
   const now = performance.now();
   const dt = Math.min((now - lastTime) / 1000, 0.05);
   lastTime = now;
 
-  controls.update();
+  processWsData();
+  orbitCtrl.update();
 
-  /* Spring-back interpolation for penetration */
+  /* Smooth penetration – squishy spring-back */
   if (isTouching) {
-    currentPen += (targetPen - currentPen) * Math.min(1, dt * 30);
+    currentPen += (targetPen - currentPen) * Math.min(1, dt * 25);
   } else {
-    /* Exponential decay when not touching */
-    currentPen *= Math.exp(-dt * 12);
+    currentPen *= Math.exp(-dt * 5);
     if (currentPen < 0.01) currentPen = 0;
   }
 
-  /* Apply deformation – local slider controls influence cone width */
-  const influenceAngle = Math.PI / 6 + (Math.PI / 3) * (localSoftness / 100);
+  /* Disc deformation */
+  const influenceR = 8 + 30 * (spreadVal / 100);
   if (currentPen > 0.01) {
-    deformSphere(sphereGeo, currentPen, contactDir, influenceAngle);
-    deformSphere(wireGeo, currentPen, contactDir, influenceAngle);
+    deformDisc(discGeo, currentPen, contactPt, influenceR);
   } else {
-    resetSphere(sphereGeo);
-    resetSphere(wireGeo);
-  }
-
-  /* Status text */
-  const forceStr = lastForceMag > 0.01 ? ` | Force: ${lastForceMag.toFixed(2)} N` : '';
-  const penStr = currentPen > 0.1 ? ` | Indent: ${currentPen.toFixed(1)} mm` : '';
-  if (lastModel) {
-    statusMsg.textContent =
-      `${lastModel} | ${isTouching ? 'TOUCHING' : 'Free'} | Pos: ${lastPosStr}${forceStr}${penStr}`;
+    resetDisc(discGeo);
   }
 
   renderer.render(scene, camera);

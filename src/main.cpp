@@ -17,6 +17,7 @@
 #include <HD/hd.h>
 
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <cmath>
 #include <string>
@@ -43,10 +44,25 @@ static struct {
 static std::mutex  g_mutex;
 static const char* g_model = "Unknown";
 
-/* Scene: sphere at origin */
-static constexpr double SPHERE_R  = 40.0;   /* mm */
-static constexpr double MAX_FORCE = 3.3;    /* N – device safety cap */
-static double g_hertzK = 0.08;              /* N/mm^1.5 – adjustable via WebSocket */
+/* Squishy oblate sphere (flat disc shape) at origin */
+static constexpr double DISC_RXZ   = 35.0;    /* mm – horizontal radius */
+static constexpr double DISC_RY    = 25.0;    /* mm – vertical (half-height) */
+static constexpr double MAX_FORCE  = 3.3;     /* N */
+static constexpr double SQUISHY_K  = 0.04;    /* N/mm^1.5 – soft rubber */
+static double g_stiffScale = 1.0;             /* adjustable via WebSocket */
+
+/* Timestamped log */
+static void logMsg(const char* fmt, ...) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    printf("[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\n");
+    fflush(stdout);
+}
 
 /* Graceful shutdown */
 static volatile bool g_running = true;
@@ -151,6 +167,23 @@ static bool wsSend(SOCKET s, const std::string& msg) {
     return send(s, frame, total, 0) == total;
 }
 
+/* Send a binary frame (server -> client, unmasked) */
+static bool wsSendBin(SOCKET s, const void* data, size_t sz) {
+    char frame[128];
+    int  hlen = 0;
+    frame[hlen++] = (char)0x82;            /* FIN | binary */
+    if (sz <= 125) {
+        frame[hlen++] = (char)sz;
+    } else {
+        frame[hlen++] = (char)126;
+        frame[hlen++] = (char)(sz >> 8);
+        frame[hlen++] = (char)(sz & 0xFF);
+    }
+    std::memcpy(frame + hlen, data, sz);
+    int total = hlen + (int)sz;
+    return send(s, frame, total, 0) == total;
+}
+
 /* Read one WebSocket frame.  Returns false on close / error. */
 static bool wsRecvFrame(SOCKET s) {
     uint8_t h[2];
@@ -184,13 +217,13 @@ static bool wsRecvFrame(SOCKET s) {
             payload[i] ^= mask[i % 4];
     }
 
-    /* Parse text frames for settings (e.g. {"k":0.05}) */
+    /* Parse text frames for settings (e.g. {"k":0.5}) */
     if (opcode == 0x1 && !payload.empty()) {
         auto kp = payload.find("\"k\":");
         if (kp != std::string::npos) {
             double val = 0;
             if (std::sscanf(payload.c_str() + kp + 4, "%lf", &val) == 1) {
-                if (val >= 0.005 && val <= 1.0) g_hertzK = val;
+                if (val > 0.0 && val <= 10.0) g_stiffScale = val;
             }
         }
     }
@@ -244,30 +277,46 @@ static HDCallbackCode HDCALLBACK servoLoop(void*) {
     HDint btn = 0;
     hdGetIntegerv(HD_CURRENT_BUTTONS, &btn);
 
-    /* Sphere collision (sphere centred at origin) – Hertzian contact */
-    double dist = std::sqrt(pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2]);
+    /* Oblate ellipsoid collision – flat disc shape at origin */
     double f[3] = {0, 0, 0};
     double cpt[3] = {0, 0, 0};
     double pen = 0.0;
     bool   touch = false;
 
-    if (dist < SPHERE_R && dist > 1e-4) {
-        pen = SPHERE_R - dist;
-        double inv = 1.0 / dist;
+    /* Scaled coordinates: map ellipsoid to unit sphere */
+    double sx = pos[0] / DISC_RXZ;
+    double sy = pos[1] / DISC_RY;
+    double sz = pos[2] / DISC_RXZ;
+    double sLen = std::sqrt(sx*sx + sy*sy + sz*sz);
 
-        /* Hertzian: F = K * pen^1.5  (soft entry, progressive stiffening) */
-        double fmag = g_hertzK * pen * std::sqrt(pen);
+    if (sLen < 1.0 && sLen > 1e-6) {
+        /* Penetration: distance from surface in scaled space, then unscale */
+        pen = (1.0 - sLen) * (DISC_RXZ < DISC_RY ? DISC_RXZ : DISC_RY);
+
+        /* Gradient of ellipsoid (outward normal, not normalized) */
+        double gx = pos[0] / (DISC_RXZ * DISC_RXZ);
+        double gy = pos[1] / (DISC_RY  * DISC_RY);
+        double gz = pos[2] / (DISC_RXZ * DISC_RXZ);
+        double gLen = std::sqrt(gx*gx + gy*gy + gz*gz);
+        if (gLen < 1e-8) gLen = 1e-8;
+
+        double fmag = SQUISHY_K * g_stiffScale * pen * std::sqrt(pen);
         if (fmag > MAX_FORCE) fmag = MAX_FORCE;
 
-        f[0] = fmag * pos[0] * inv;
-        f[1] = fmag * pos[1] * inv;
-        f[2] = fmag * pos[2] * inv;
+        /* Force along ellipsoid normal (outward) */
+        f[0] = fmag * gx / gLen;
+        f[1] = fmag * gy / gLen;
+        f[2] = fmag * gz / gLen;
 
-        /* Contact point on sphere surface */
-        cpt[0] = pos[0] * inv * SPHERE_R;
-        cpt[1] = pos[1] * inv * SPHERE_R;
-        cpt[2] = pos[2] * inv * SPHERE_R;
-
+        /* Contact point: project pos onto ellipsoid surface */
+        double inv = 1.0 / sLen;
+        cpt[0] = pos[0] * inv;   /* = sx/sLen * DISC_RXZ */
+        cpt[1] = pos[1] * inv;
+        cpt[2] = pos[2] * inv;
+        /* But scale back: cpt is on unit sphere in scaled space → unscale */
+        cpt[0] = sx * inv * DISC_RXZ;
+        cpt[1] = sy * inv * DISC_RY;
+        cpt[2] = sz * inv * DISC_RXZ;
         touch = true;
     }
 
@@ -371,26 +420,43 @@ int main() {
     /* --- Main loop ---------------------------------------------- */
     SOCKET    wsClient = INVALID_SOCKET;
     ULONGLONG lastSend = 0;
+    int       sendCount = 0;
 
     while (g_running) {
-        /* select(): server socket + optional ws client, 16 ms timeout */
-        fd_set rd;
-        FD_ZERO(&rd);
+        /* Single select() for read + write + exception */
+        fd_set rd, wr, ex;
+        FD_ZERO(&rd); FD_ZERO(&wr); FD_ZERO(&ex);
         FD_SET(srv, &rd);
-        if (wsClient != INVALID_SOCKET) FD_SET(wsClient, &rd);
+
+        ULONGLONG now = GetTickCount64();
+        bool wantSend = (wsClient != INVALID_SOCKET && now - lastSend >= 16);
+
+        if (wsClient != INVALID_SOCKET) {
+            FD_SET(wsClient, &rd);
+            FD_SET(wsClient, &ex);
+            if (wantSend) FD_SET(wsClient, &wr);
+        }
 
         timeval tv{0, 16000};
-        select(0, &rd, nullptr, nullptr, &tv);
+        select(0, &rd, &wr, &ex, &tv);
+
+        /* ---- Socket exception ---------------------------------- */
+        if (wsClient != INVALID_SOCKET && FD_ISSET(wsClient, &ex)) {
+            int soErr = 0; int soLen = sizeof soErr;
+            getsockopt(wsClient, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+            logMsg("WS disconnect: socket exception (SO_ERROR=%d, sent=%d)", soErr, sendCount);
+            closesocket(wsClient);
+            wsClient = INVALID_SOCKET;
+        }
 
         /* ---- Accept new TCP connection ------------------------- */
         if (FD_ISSET(srv, &rd)) {
             SOCKET c = accept(srv, nullptr, nullptr);
             if (c != INVALID_SOCKET) {
-                /* Disable Nagle – send 101 response immediately */
                 int one = 1;
                 setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char*)&one, sizeof one);
 
-                /* blocking recv with short timeout */
+                /* blocking recv with short timeout for HTTP request */
                 u_long blk = 0;
                 ioctlsocket(c, FIONBIO, &blk);
                 DWORD tmo = 500;
@@ -401,28 +467,26 @@ int main() {
                 if (n > 0) {
                     buf[n] = '\0';
                     std::string req(buf, n);
-
-                    /* case-insensitive check for WebSocket upgrade */
                     std::string lower(req);
                     for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
 
                     if (lower.find("upgrade: websocket") != std::string::npos) {
                         if (wsHandshake(c, req)) {
-                            if (wsClient != INVALID_SOCKET) closesocket(wsClient);
+                            if (wsClient != INVALID_SOCKET) {
+                                logMsg("WS disconnect: replaced (sent=%d)", sendCount);
+                                closesocket(wsClient);
+                            }
                             wsClient = c;
-                            /* generous timeouts - actual read/write guarded by select() */
-                            DWORD wsTmo = 30000;
-                            setsockopt(wsClient, SOL_SOCKET, SO_RCVTIMEO, (char*)&wsTmo, sizeof wsTmo);
-                            DWORD sndTmo = 5000;
-                            setsockopt(wsClient, SOL_SOCKET, SO_SNDTIMEO, (char*)&sndTmo, sizeof sndTmo);
-
+                            /* Non-blocking for ALL future I/O – never toggle back */
+                            u_long nonBlock = 1;
+                            ioctlsocket(wsClient, FIONBIO, &nonBlock);
                             lastSend = GetTickCount64();
-                            printf("WebSocket client connected.\n");
+                            sendCount = 0;
+                            logMsg("WebSocket client connected.");
                         } else {
                             closesocket(c);
                         }
                     } else {
-                        /* Regular HTTP */
                         bool isRoot  = req.find("GET / HTTP")       != std::string::npos;
                         bool isIndex = req.find("GET /index.html")  != std::string::npos;
                         if ((isRoot || isIndex) && !html.empty())
@@ -439,29 +503,29 @@ int main() {
 
         /* ---- Incoming WebSocket frames ------------------------- */
         if (wsClient != INVALID_SOCKET && FD_ISSET(wsClient, &rd)) {
-            u_long nb = 1;
-            ioctlsocket(wsClient, FIONBIO, &nb);
+            /* Socket is non-blocking – peek won't block */
             char peek;
             int peekN = recv(wsClient, &peek, 1, MSG_PEEK);
-            nb = 0;
-            ioctlsocket(wsClient, FIONBIO, &nb);
-
             if (peekN == 0) {
-                printf("WebSocket client disconnected.\n");
+                logMsg("WS disconnect: peer closed (sent=%d)", sendCount);
                 closesocket(wsClient);
                 wsClient = INVALID_SOCKET;
             } else if (peekN > 0) {
                 if (!wsRecvFrame(wsClient)) {
-                    printf("WebSocket client disconnected (frame error).\n");
-                    closesocket(wsClient);
-                    wsClient = INVALID_SOCKET;
+                    int err = WSAGetLastError();
+                    if (err != WSAEWOULDBLOCK) {
+                        logMsg("WS disconnect: frame error (WSA=%d, sent=%d)", err, sendCount);
+                        closesocket(wsClient);
+                        wsClient = INVALID_SOCKET;
+                    }
                 }
             }
+            /* peekN < 0 with WSAEWOULDBLOCK: spurious select, ignore */
         }
 
         /* ---- Send haptic state at ~60 Hz ----------------------- */
-        ULONGLONG now = GetTickCount64();
-        if (wsClient != INVALID_SOCKET && now - lastSend >= 16) {
+        now = GetTickCount64();
+        if (wsClient != INVALID_SOCKET && wantSend && FD_ISSET(wsClient, &wr)) {
             lastSend = now;
 
             double p[3], f[3], cpt[3];
@@ -478,17 +542,30 @@ int main() {
                 touch = g_haptic.touching;
             }
 
-            char json[512];
-            snprintf(json, sizeof json,
-                "{\"pos\":[%.2f,%.2f,%.2f],\"btn\":%d,\"touch\":%s,"
-                "\"force\":[%.3f,%.3f,%.3f],\"model\":\"%s\","
-                "\"pen\":%.2f,\"cpt\":[%.2f,%.2f,%.2f]}",
-                p[0], p[1], p[2], btn, touch ? "true" : "false",
-                f[0], f[1], f[2], g_model,
-                pen, cpt[0], cpt[1], cpt[2]);
+            double packet[7];
+            packet[0] = p[0]; packet[1] = p[1]; packet[2] = p[2];
+            packet[3] = touch ? pen : 0.0;
+            packet[4] = cpt[0]; packet[5] = cpt[1]; packet[6] = cpt[2];
 
-            if (!wsSend(wsClient, json)) {
-                printf("WebSocket send failed, disconnecting.\n");
+            /* Build & send binary WS frame inline */
+            char frame[64];
+            frame[0] = (char)0x82;
+            frame[1] = (char)sizeof(packet);
+            std::memcpy(frame + 2, packet, sizeof(packet));
+            int total = 2 + (int)sizeof(packet);
+
+            int n = send(wsClient, frame, total, 0);
+            if (n == total) {
+                sendCount++;
+            } else if (n == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                if (err != WSAEWOULDBLOCK) {
+                    logMsg("WS disconnect: send failed (WSA=%d, sent=%d)", err, sendCount);
+                    closesocket(wsClient);
+                    wsClient = INVALID_SOCKET;
+                }
+            } else {
+                logMsg("WS disconnect: partial send %d/%d (sent=%d)", n, total, sendCount);
                 closesocket(wsClient);
                 wsClient = INVALID_SOCKET;
             }
